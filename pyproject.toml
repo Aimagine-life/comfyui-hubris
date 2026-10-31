@@ -1,0 +1,23 @@
+[project]
+name = "comfyui-hubris"
+description = "Hubris nodes for ComfyUI: hundreds of text models, Nano Banana, GPT Image, FLUX, Seedream and Recraft for images, Kling, Veo, Seedance, Wan and Hailuo for video, and text to speech, all with one API key."
+version = "1.0.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
+classifiers = ["Operating System :: OS Independent"]
+
+[project.urls]
+Repository = "https://github.com/Aimagine-life/comfyui-hubris"
+Documentation = "https://hubris.pw/docs/integrations/comfyui"
+"Bug Tracker" = "https://github.com/Aimagine-life/comfyui-hubris/issues"
+
+[tool.comfy]
+PublisherId = "hubris"
+DisplayName = "Hubris"
+Icon = "https://hubris.pw/app-icons/icon-192.png"
+includes = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"

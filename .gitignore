@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+hubris_api_key.txt
+catalog_cache.json
+temp/
+.pytest_cache/
