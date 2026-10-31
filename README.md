@@ -11,7 +11,7 @@ The model lists come from the live Hubris catalog when ComfyUI starts.
 
 ## Install
 
-ComfyUI Manager: search for **Hubris** and press Install. Or by hand:
+Clone the package into `custom_nodes` and restart ComfyUI:
 
 ```
 cd ComfyUI/custom_nodes
