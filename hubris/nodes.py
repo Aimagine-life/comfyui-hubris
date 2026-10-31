@@ -83,7 +83,8 @@ class HubrisChat:
             body["max_tokens"] = max_tokens
         if catalog.supports(model, "seed"):
             body["seed"] = seed
-        response = client.request("POST", "/chat/completions", json=body)
+        # Reasoning models can think for many minutes; a short read timeout would bill without an answer.
+        response = client.request("POST", "/chat/completions", json=body, timeout=(15, 1800))
         choice = (response.get("choices") or [{}])[0]
         text = (choice.get("message") or {}).get("content") or ""
         if not text:
@@ -108,6 +109,7 @@ class HubrisImage:
             "optional": {
                 "reference_images": ("IMAGE", {"tooltip": "Images to edit or use as references"}),
             },
+            "hidden": {"unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("IMAGE",)
@@ -116,18 +118,33 @@ class HubrisImage:
     CATEGORY = CATEGORY
     DESCRIPTION = "Generate or edit images: Nano Banana, GPT Image, FLUX, Seedream, Recraft and more."
 
-    def run(self, model, prompt, aspect_ratio, count, seed, reference_images=None):
+    def run(self, model, prompt, aspect_ratio, count, seed, reference_images=None, unique_id=None):
         if not prompt.strip():
             raise HubrisError("Prompt is empty")
         references = convert.tensor_to_data_urls(reference_images)
+        if catalog.get(model) is None:
+            raise HubrisError(f"{model} is not in the Hubris catalog, or the catalog could not be loaded; "
+                              "check the connection and try again in a minute")
         chat = catalog.is_chat_image_model(model)
         if not chat:
             check_image_options(model, aspect_ratio, references)
         generate = self._chat if chat else self._images_api
         # One request per image: many models reject n > 1, and the price is per image anyway.
         with ThreadPoolExecutor(max_workers=min(count, 4)) as pool:
-            batches = list(pool.map(lambda i: generate(model, prompt, aspect_ratio, (seed + i) % 0x80000000, references), range(count)))
-        images = [image for batch in batches for image in batch][:count]
+            futures = [pool.submit(generate, model, prompt, aspect_ratio, (seed + i) % 0x80000000, references)
+                       for i in range(count)]
+        images, errors = [], []
+        for future in futures:
+            try:
+                images.extend(future.result())
+            except HubrisError as error:
+                errors.append(error)
+        if not images:
+            raise errors[0]
+        if errors:
+            # The images that did arrive are paid for: return them instead of failing the whole node.
+            _progress(unique_id, f"{len(errors)} of {count} images failed: {errors[0]}")
+        images = images[:count]
         return (convert.stack_images(images),)
 
     @staticmethod
@@ -210,37 +227,56 @@ class HubrisVideo:
 
     def run(self, model, prompt, duration, resolution, aspect_ratio, generate_audio, seed,
             first_frame=None, last_frame=None, unique_id=None):
+        try:  # checked before any money is spent
+            from comfy_api.input_impl import VideoFromFile
+        except ImportError as exc:
+            raise HubrisError("This ComfyUI has no VIDEO type; update ComfyUI to use Hubris Video") from exc
         info = catalog.video_model(model)
         if info is None:
             raise HubrisError(f"Video model {model} is not available")
         body = build_video_body(info, prompt, duration, resolution, aspect_ratio, generate_audio, seed,
                                 convert.tensor_to_data_urls(first_frame, 1), convert.tensor_to_data_urls(last_frame, 1))
         job = client.request("POST", "/videos", json=body, headers={"Idempotency-Key": str(uuid.uuid4())}, timeout=120)
-        video_id = job["id"]
-        started = time.monotonic()
+        video_id = job.get("id")
+        if not video_id:
+            raise HubrisError("Hubris API did not return a video id; check https://hubris.pw/logs before retrying")
+        try:
+            path = self._wait_and_download(video_id, job, unique_id)
+        except HubrisError as error:
+            raise HubrisError(f"{error} (video {video_id}, see https://hubris.pw/logs)", error.status) from error
+        return (VideoFromFile(str(path)), str(path))
+
+    def _wait_and_download(self, video_id, job, unique_id):
+        """Poll until the job ends; network hiccups and 5xx are retried, the job is already paid for."""
         status = job.get("status")
+        started = time.monotonic()
+        deadline = started + self.TIMEOUT_SECONDS
+
+        def elapsed():
+            return int(time.monotonic() - started)
+
         while status not in ("completed", "failed"):
-            elapsed = int(time.monotonic() - started)
-            if elapsed > self.TIMEOUT_SECONDS:
-                raise HubrisError(f"Video {video_id} is still not ready after {elapsed // 60} min; check it at https://hubris.pw/logs")
-            _progress(unique_id, f"{status} · {elapsed} s")
+            if time.monotonic() > deadline:
+                raise HubrisError(f"Video is still not ready after {elapsed() // 60} min")
+            _progress(unique_id, f"{status} · {elapsed()} s")
             for _ in range(self.POLL_SECONDS * 4):
                 _check_interrupted()
                 time.sleep(0.25)
-            job = client.request("GET", f"/videos/{video_id}", timeout=60)
+            job = client.retry_until(deadline, lambda: client.request("GET", f"/videos/{video_id}", timeout=60),
+                                     _check_interrupted)
             status = job.get("status")
         if status == "failed":
             error = job.get("error") or {}
             raise HubrisError(f"Video generation failed: {error.get('message') if isinstance(error, dict) else error}")
         _progress(unique_id, "downloading")
-        content = client.request("GET", f"/videos/{video_id}/content", params={"index": 0}, timeout=600, raw=True).content
-        path = _save_video(video_id, content)
-        _progress(unique_id, f"done · {int(time.monotonic() - started)} s")
-        try:
-            from comfy_api.input_impl import VideoFromFile
-        except ImportError as exc:
-            raise HubrisError(f"This ComfyUI has no VIDEO type; update ComfyUI. The video is saved at {path}") from exc
-        return (VideoFromFile(str(path)), str(path))
+        response = client.retry_until(
+            time.monotonic() + 15 * 60,
+            lambda: client.request("GET", f"/videos/{video_id}/content", params={"index": 0}, timeout=600, raw=True),
+            _check_interrupted,
+        )
+        path = _save_video(video_id, response.content)
+        _progress(unique_id, f"done · {elapsed()} s")
+        return path
 
 
 def build_video_body(info, prompt, duration, resolution, aspect_ratio, generate_audio, seed, first, last):

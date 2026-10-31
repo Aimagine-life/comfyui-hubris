@@ -18,13 +18,13 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/Aimagine-life/comfyui-hubris
 ```
 
-No extra Python packages are needed.
+No extra Python packages are needed on a current ComfyUI (the video and speech nodes rely on its `VIDEO` type and PyAV).
 
 ## API key
 
 Create a key at [hubris.pw/keys](https://hubris.pw/keys), then either:
 
-- paste it into `ComfyUI/custom_nodes/comfyui-hubris/hubris_api_key.txt` (one line, works without a restart), or
+- paste it into `ComfyUI/user/hubris_api_key.txt` (one line, works without a restart, survives node updates), or
 - set the `HUBRIS_API_KEY` environment variable and restart ComfyUI.
 
 The key is never stored in workflows, so you can share them safely.
@@ -33,8 +33,8 @@ The key is never stored in workflows, so you can share them safely.
 
 - **Seed** defaults to `fixed`: running the same graph again reuses the previous result and does not spend money. Change the seed, or switch it to `randomize`, for a new result.
 - **Image**, `aspect_ratio`: `auto` lets the model choose. Models that pick the size themselves reject other values before any request is made.
-- **Image**, `count`: one request per image, so every model can return several.
-- **Video**: duration, resolution, aspect ratio, audio and frame inputs are checked against the model before the job starts. The node shows the job status while it waits. If you cancel the run, the job still finishes on Hubris and is billed. The `file_path` output is the mp4 in ComfyUI's temp folder. Use **Save Video** to keep it.
+- **Image**, `count`: one request per image, so every model can return several. If some of them fail, the node returns the ones that arrived and shows how many failed.
+- **Video**: duration, resolution, aspect ratio, audio and frame inputs are checked against the model before the job starts. The node shows the job status while it waits and rides out short network or server hiccups. If you cancel the run, the job still finishes on Hubris and is billed. The `file_path` output is the mp4 in ComfyUI's temp folder. Use **Save Video** to keep it.
 - **Speech**: leave `voice` empty to use the model's first voice. A wrong voice name returns an error that lists the available voices.
 - Vector (SVG) image models are left out of the list, because ComfyUI images are raster.
 

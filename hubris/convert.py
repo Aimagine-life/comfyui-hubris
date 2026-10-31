@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import io
 
-import av
 import numpy as np
 import torch
 from PIL import Image
 
+from . import client
 from .client import HubrisError
 
 MAX_REFERENCE_SIDE = 2048
@@ -36,11 +37,9 @@ def tensor_to_data_urls(images: torch.Tensor | None, limit: int | None = None) -
 
 
 def decode_image(data: str | bytes) -> torch.Tensor:
-    """base64 / data URL / bytes -> [H, W, 3] float tensor."""
+    """base64 / data URL / https URL / bytes -> [H, W, 3] float tensor."""
     if isinstance(data, str):
-        if data.startswith("data:"):
-            data = data.split(",", 1)[1]
-        data = base64.b64decode(data)
+        data = _image_bytes(data)
     head = data[:512].lstrip().lower()
     if head.startswith(b"<svg") or head.startswith(b"<?xml"):
         raise HubrisError("This model returns SVG vector images, which ComfyUI cannot load. Pick a raster model.")
@@ -51,6 +50,22 @@ def decode_image(data: str | bytes) -> torch.Tensor:
         raise HubrisError("Hubris API returned an image that cannot be decoded") from exc
     array = np.asarray(pil.convert("RGB"), dtype=np.float32) / 255.0
     return torch.from_numpy(array)
+
+
+def _image_bytes(data: str) -> bytes:
+    if data.startswith(("http://", "https://")):
+        try:
+            response = client.requests.get(data, timeout=120, headers={"User-Agent": client.USER_AGENT})
+            response.raise_for_status()
+        except client.requests.RequestException as exc:
+            raise HubrisError(f"Cannot download the generated image: {exc.__class__.__name__}") from exc
+        return response.content
+    if data.startswith("data:"):
+        data = data.split(",", 1)[-1]
+    try:
+        return base64.b64decode(data)
+    except (binascii.Error, ValueError) as exc:
+        raise HubrisError("Hubris API returned an image that cannot be decoded") from exc
 
 
 def stack_images(images: list[torch.Tensor]) -> torch.Tensor:
@@ -68,6 +83,10 @@ def stack_images(images: list[torch.Tensor]) -> torch.Tensor:
 
 def decode_audio(data: bytes) -> dict:
     """mp3 bytes -> ComfyUI AUDIO {"waveform": [1, C, S], "sample_rate"}."""
+    try:
+        import av
+    except ImportError as exc:
+        raise HubrisError("This ComfyUI has no PyAV (av) package; update ComfyUI to decode audio") from exc
     try:
         with av.open(io.BytesIO(data)) as container:
             stream = container.streams.audio[0]

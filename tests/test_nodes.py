@@ -155,3 +155,127 @@ def test_key_file_is_read(monkeypatch, tmp_path):
     key_file.write_text("sk-gw-abc\n", encoding="utf-8")
     monkeypatch.setattr(client, "KEY_FILE", key_file)
     assert client.get_api_key() == "sk-gw-abc"
+
+
+def test_bad_base64_gives_readable_error():
+    with pytest.raises(HubrisError, match="cannot be decoded"):
+        convert.decode_image("data:image/png;base64,@@@")
+
+
+def test_retry_until_repeats_transient_errors(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise HubrisError("502", 502)
+        return "ok"
+
+    assert client.retry_until(float("inf"), flaky) == "ok"
+    assert len(calls) == 3
+
+
+def test_retry_until_does_not_repeat_client_errors(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    with pytest.raises(HubrisError):
+        client.retry_until(float("inf"), lambda: (_ for _ in ()).throw(HubrisError("404", 404)))
+
+
+def test_failed_catalog_fetch_is_retried_later(monkeypatch, tmp_path):
+    monkeypatch.setattr(catalog, "_models", None)
+    monkeypatch.setattr(catalog, "_failed_at", 0.0)
+    monkeypatch.setattr(catalog, "CACHE_FILE", tmp_path / "cache.json")
+    answers = [HubrisError("down"), {"data": [{"id": "a/text", "output_modalities": ["text"]}]}]
+
+    def fake_request(*args, **kwargs):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(client, "request", fake_request)
+    assert catalog._load() == []
+    monkeypatch.setattr(catalog, "_failed_at", -1000.0)
+    assert [m["id"] for m in catalog._load()] == ["a/text"]
+
+
+def test_empty_catalog_does_not_overwrite_cache(monkeypatch, tmp_path):
+    cache = tmp_path / "cache.json"
+    cache.write_text('[{"id": "a/old"}]', encoding="utf-8")
+    monkeypatch.setattr(catalog, "_models", None)
+    monkeypatch.setattr(catalog, "_failed_at", 0.0)
+    monkeypatch.setattr(catalog, "CACHE_FILE", cache)
+    monkeypatch.setattr(client, "request", lambda *a, **k: {"data": []})
+    assert [m["id"] for m in catalog._load()] == ["a/old"]
+    assert "a/old" in cache.read_text(encoding="utf-8")
+
+
+def test_image_node_returns_paid_images_when_some_fail(monkeypatch):
+    from hubris.nodes import HubrisImage
+
+    calls = []
+
+    def fake_images_api(model, prompt, aspect_ratio, seed, references):
+        calls.append(seed)
+        if len(calls) == 2:
+            raise HubrisError("moderation", 400)
+        return [torch.zeros(4, 4, 3)]
+
+    monkeypatch.setattr(HubrisImage, "_images_api", staticmethod(fake_images_api))
+    (batch,) = HubrisImage().run("a/flux", "fox", "auto", 3, 0)
+    assert batch.shape[0] == 2
+
+
+def test_image_node_fails_when_all_fail(monkeypatch):
+    from hubris.nodes import HubrisImage
+
+    def failing(*args):
+        raise HubrisError("down", 503)
+
+    monkeypatch.setattr(HubrisImage, "_images_api", staticmethod(failing))
+    with pytest.raises(HubrisError, match="down"):
+        HubrisImage().run("a/flux", "fox", "auto", 2, 0)
+
+
+def test_image_node_refuses_unknown_model():
+    from hubris.nodes import HubrisImage
+
+    with pytest.raises(HubrisError, match="not in the Hubris catalog"):
+        HubrisImage().run("a/missing", "fox", "auto", 1, 0)
+
+
+def test_video_poll_survives_a_server_error(monkeypatch, tmp_path):
+    from hubris import nodes
+    from hubris.nodes import HubrisVideo
+
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    monkeypatch.setattr(nodes, "_save_video", lambda video_id, content: tmp_path / f"{video_id}.mp4")
+    answers = [HubrisError("502", 502), {"status": "in_progress"}, None, {"status": "completed"}]
+
+    class Raw:
+        content = b"mp4"
+
+    def fake_request(method, path, **kwargs):
+        if path.endswith("/content"):
+            return Raw()
+        answer = answers.pop(0)
+        if answer is None:
+            raise HubrisError("Cannot reach Hubris API: ConnectionError")
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(client, "request", fake_request)
+    path = HubrisVideo()._wait_and_download("vid-1", {"status": "pending"}, None)
+    assert path.name == "vid-1.mp4"
+    assert answers == []
+
+
+def test_video_without_video_type_fails_before_paying(monkeypatch):
+    from hubris.nodes import HubrisVideo
+
+    monkeypatch.setitem(sys.modules, "comfy_api", None)
+    monkeypatch.setattr(client, "request", lambda *a, **k: pytest.fail("no request expected"))
+    with pytest.raises(HubrisError, match="update ComfyUI"):
+        HubrisVideo().run("a/video", "fox", 5, "auto", "auto", False, 0)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 from . import client
@@ -19,26 +20,44 @@ DEFAULTS = {
     "speech": ["google/gemini-3.8-flash-tts", "elevenlabs/eleven-flash-v2.5", "microsoft/mai-voice-2-flash"],
 }
 
+RETRY_SECONDS = 60
+
 _models: list[dict[str, Any]] | None = None
+_failed_at = 0.0
+
+
+def _valid(data: Any) -> bool:
+    return isinstance(data, list) and bool(data) and all(isinstance(m, dict) and "id" in m for m in data)
+
+
+def _read_cache() -> list[dict[str, Any]]:
+    try:
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return data if _valid(data) else []
 
 
 def _load() -> list[dict[str, Any]]:
-    global _models
+    """Live catalog; on failure the disk cache, and another try after RETRY_SECONDS."""
+    global _models, _failed_at
     if _models is not None:
         return _models
+    if _failed_at and time.monotonic() - _failed_at < RETRY_SECONDS:
+        return _read_cache()
     try:
-        body = client.request("GET", "/models", params={"output_modalities": "all"}, auth=False, timeout=15)
-        _models = body["data"]
-        try:
-            CACHE_FILE.write_text(json.dumps(_models), encoding="utf-8")
-        except OSError:
-            pass
+        data = client.request("GET", "/models", params={"output_modalities": "all"}, auth=False, timeout=15).get("data")
+        if not _valid(data):
+            raise ValueError("empty catalog")
     except Exception as exc:  # startup must not fail because the network is down
         log.warning("[Hubris] catalog fetch failed (%s), using cache", exc)
-        try:
-            _models = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            _models = []
+        _failed_at = time.monotonic()
+        return _read_cache()
+    _models = data
+    try:
+        CACHE_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
     return _models
 
 
@@ -56,7 +75,7 @@ def is_vector(model: dict[str, Any]) -> bool:
 
 
 def model_ids(kind: str) -> list[str]:
-    ids = sorted(m["id"] for m in _load() if matches(m, kind))
+    ids = sorted({m["id"] for m in _load() if matches(m, kind)})
     preferred = next((d for d in DEFAULTS[kind] if d in ids), None)
     if preferred:
         ids.remove(preferred)

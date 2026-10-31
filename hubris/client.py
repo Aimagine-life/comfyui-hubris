@@ -3,35 +3,57 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
 BASE_URL = os.environ.get("HUBRIS_BASE_URL", "https://api.hubris.pw/v1").rstrip("/")
 PACKAGE_DIR = Path(__file__).resolve().parent.parent
-KEY_FILE = PACKAGE_DIR / "hubris_api_key.txt"
-USER_AGENT = "comfyui-hubris/1.0.0"
+KEY_NAME = "hubris_api_key.txt"
+KEY_FILE = PACKAGE_DIR / KEY_NAME  # older installs; lost when the node is updated
+USER_AGENT = "comfyui-hubris/1.0.1"
 
-KEY_HELP = (
-    "Hubris API key not found. Create a key at https://hubris.pw/keys and paste it into "
-    f"{KEY_FILE} (one line, works right away) or set the HUBRIS_API_KEY environment "
-    "variable and restart ComfyUI."
-)
+
+def _user_key_file() -> Path | None:
+    """ComfyUI/user/hubris_api_key.txt: survives node updates."""
+    try:
+        import folder_paths
+
+        return Path(folder_paths.get_user_directory()) / KEY_NAME
+    except (ImportError, AttributeError):
+        return None
+
+
+def _key_help() -> str:
+    place = _user_key_file() or KEY_FILE
+    return (
+        "Hubris API key not found. Create a key at https://hubris.pw/keys and paste it into "
+        f"{place} (one line, works right away) or set the HUBRIS_API_KEY environment "
+        "variable and restart ComfyUI."
+    )
 
 
 class HubrisError(Exception):
     """Error shown to the user in the ComfyUI error dialog."""
 
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status  # HTTP status; None for network errors and local checks
+
 
 def get_api_key() -> str:
     key = os.environ.get("HUBRIS_API_KEY", "").strip()
-    if not key and KEY_FILE.is_file():
-        key = KEY_FILE.read_text(encoding="utf-8-sig").strip()
+    for path in (_user_key_file(), KEY_FILE):
+        if key:
+            break
+        if path and path.is_file():
+            key = path.read_text(encoding="utf-8-sig").strip()
     if not key:
-        raise HubrisError(KEY_HELP)
+        raise HubrisError(_key_help())
     if not key.startswith("sk-gw-"):
-        raise HubrisError("Hubris API key must start with sk-gw-. " + KEY_HELP)
+        raise HubrisError("Hubris API key must start with sk-gw-. " + _key_help())
     return key
 
 
@@ -64,7 +86,7 @@ def request(
     params: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
     auth: bool = True,
-    timeout: float = 600,
+    timeout: float | tuple[float, float] = 600,
     raw: bool = False,
 ) -> Any:
     url = f"{BASE_URL}{path}"
@@ -77,13 +99,36 @@ def request(
             headers=_headers(headers, auth),
             timeout=timeout,
         )
+    except requests.Timeout as exc:
+        raise HubrisError(
+            "Hubris API did not answer in time. The request may still have run and been billed; "
+            "check https://hubris.pw/logs before retrying"
+        ) from exc
     except requests.RequestException as exc:
         raise HubrisError(f"Cannot reach Hubris API: {exc.__class__.__name__}") from exc
     if response.status_code >= 400:
-        raise HubrisError(error_message(response))
+        raise HubrisError(error_message(response), response.status_code)
     if raw:
         return response
     try:
         return response.json()
     except ValueError as exc:
         raise HubrisError("Hubris API returned a non-JSON response") from exc
+
+
+def is_transient(error: HubrisError) -> bool:
+    """Network failure, rate limit or server error: worth retrying a read-only request."""
+    return error.status is None or error.status == 429 or error.status >= 500
+
+
+def retry_until(deadline: float, call: Callable[[], Any], on_wait: Callable[[], None] = lambda: None) -> Any:
+    """Repeat a read-only call on transient errors until the monotonic deadline."""
+    while True:
+        try:
+            return call()
+        except HubrisError as error:
+            if not is_transient(error) or time.monotonic() > deadline:
+                raise
+        for _ in range(20):
+            on_wait()
+            time.sleep(0.25)

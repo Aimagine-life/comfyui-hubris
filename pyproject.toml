@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-hubris"
 description = "Hubris nodes for ComfyUI: hundreds of text models, Nano Banana, GPT Image, FLUX, Seedream and Recraft for images, Kling, Veo, Seedance, Wan and Hailuo for video, and text to speech, all with one API key."
-version = "1.0.0"
+version = "1.0.1"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = []
